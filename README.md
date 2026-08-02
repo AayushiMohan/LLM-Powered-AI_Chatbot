@@ -8,7 +8,7 @@ A full-stack conversational AI chatbot powered by Groq's LLaMA 3.3 model, built 
 ![MongoDB](https://img.shields.io/badge/MongoDB-47A248?style=for-the-badge&logo=mongodb&logoColor=white)
 ![Groq](https://img.shields.io/badge/Groq_API-F55036?style=for-the-badge&logo=groq&logoColor=white)
 
-🔗 **Live Demo:** [llm-powered-ai-chatbot.vercel.app](https://llm-powered-ai-chatbot.vercel.app) &nbsp;|&nbsp; **Backend API:** [llm-powered-ai-chatbot.onrender.com](https://llm-powered-ai-chatbot.onrender.com)
+🔗 **Live Demo:** https://chat-shiva.vercel.app/
 
 ---
 
