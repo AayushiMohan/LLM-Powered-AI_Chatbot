@@ -16,12 +16,29 @@
   --radius:    16px;
 }
 
+[data-theme="light"] {
+  --bg:        #f5f6fa;
+  --surface:   #ffffff;
+  --surface2:  #eef0f7;
+  --border:    #dde1ee;
+  --accent:    #4c6ef5;
+  --accent2:   #8b5cf6;
+  --text:      #1a1d29;
+  --muted:     #6b7089;
+  --user-bg:   #4c6ef5;
+  --ai-bg:     #eef0f7;
+}
+
 body {
   background: var(--bg);
   color: var(--text);
   font-family: 'DM Sans', sans-serif;
   height: 100vh;
   overflow: hidden;
+}
+
+.app, .app * {
+  transition: background-color 0.2s, border-color 0.2s, color 0.2s;
 }
 
 .app {
@@ -88,6 +105,103 @@ body {
   transition: all 0.2s;
 }
 .clear-btn:hover { color: var(--text); border-color: var(--accent); }
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.icon-btn {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
+  font-size: 14px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+}
+.icon-btn:hover { border-color: var(--accent); transform: translateY(-1px); }
+
+.sources-row {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.source-chip {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 10.5px;
+  color: var(--accent);
+}
+
+/* --- RAG document bar --- */
+.docs-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 20px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+
+.upload-btn {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 6px 14px;
+  border-radius: 8px;
+  font-size: 12.5px;
+  cursor: pointer;
+  font-family: 'DM Sans', sans-serif;
+  transition: all 0.2s;
+  flex-shrink: 0;
+}
+.upload-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.upload-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+
+.doc-pills {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.doc-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  padding: 4px 6px 4px 10px;
+  border-radius: 999px;
+  font-size: 11.5px;
+}
+
+.doc-pill button {
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 2px 4px;
+}
+.doc-pill button:hover { color: #f87171; }
 
 .chat-area {
   flex: 1;
