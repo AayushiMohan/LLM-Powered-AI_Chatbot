@@ -1,3 +1,4 @@
+/* eslint-disable no-loop-func */
 import { useState, useRef, useEffect } from "react";
 import "./App.css";
 
