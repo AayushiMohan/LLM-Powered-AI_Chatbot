@@ -1,7 +1,4 @@
 const DocumentChunk = require("../models/DocumentChunk");
-
-// In-memory cache of { filename, chunkIndex, text, embedding } for fast search.
-// Fine at small/medium scale (thousands of chunks). Rebuilt from Mongo on boot.
 let cache = [];
 
 async function loadCacheFromDB() {
@@ -21,18 +18,19 @@ function removeFromCache(filename) {
 function cosineSimilarity(a, b) {
   let dot = 0;
   for (let i = 0; i < a.length; i++) dot += a[i] * b[i];
-  // embeddings from embedService are already normalized, so dot product == cosine similarity
+
   return dot;
 }
 
-/**
- * Return the top-k most relevant chunks for a query embedding.
- * @param {number[]} queryEmbedding
- * @param {number} k
- * @param {number} minScore  ignore chunks below this similarity
- */
-function search(queryEmbedding, k = 4, minScore = 0.35) {
+function search(queryEmbedding, k = 6, minScore = 0.15) {
   if (cache.length === 0) return [];
+  
+  const SMALL_KB_THRESHOLD = 12;
+  if (cache.length <= SMALL_KB_THRESHOLD) {
+    return [...cache].sort((a, b) =>
+      a.filename === b.filename ? a.chunkIndex - b.chunkIndex : a.filename.localeCompare(b.filename)
+    );
+  }
 
   const scored = cache.map((c) => ({
     ...c,
