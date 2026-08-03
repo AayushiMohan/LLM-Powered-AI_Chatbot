@@ -262,6 +262,7 @@ body {
 
 .message.assistant .bubble {
   background: var(--ai-bg);
+  color: var(--text);
   border-radius: 4px var(--radius) var(--radius) var(--radius);
 }
 
