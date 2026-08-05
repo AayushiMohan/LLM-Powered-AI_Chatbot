@@ -1,40 +1,36 @@
-// Free, local embeddings using transformers.js (@xenova/transformers).
-// Model runs entirely in Node - downloads once (~90MB) then works offline.
-
 let embedderPromise = null;
 
 async function getEmbedder() {
   if (!embedderPromise) {
-    // Dynamic import because @xenova/transformers is an ESM package
+    
     const { pipeline } = await import("@xenova/transformers");
     embedderPromise = pipeline(
       "feature-extraction",
-      "Xenova/all-MiniLM-L6-v2" // 384-dim, small + fast, good quality for RAG
+      "Xenova/all-MiniLM-L6-v2" 
     );
   }
   return embedderPromise;
 }
 
-/**
- * Embed a single piece of text into a normalized vector.
- * @param {string} text
- * @returns {Promise<number[]>}
- */
 async function embedText(text) {
   const embedder = await getEmbedder();
   const output = await embedder(text, { pooling: "mean", normalize: true });
   return Array.from(output.data);
 }
 
-/**
- * Embed multiple texts (sequentially - fine for small/medium docs).
- * @param {string[]} texts
- * @returns {Promise<number[][]>}
- */
 async function embedBatch(texts) {
+  if (texts.length === 0) return [];
+  const embedder = await getEmbedder();
+  const output = await embedder(texts, { pooling: "mean", normalize: true });
+
+  const dims = output.dims; // [batchSize, hiddenSize]
+  const hiddenSize = dims[dims.length - 1];
+  const batchSize = dims[0];
+  const flat = Array.from(output.data);
+
   const results = [];
-  for (const t of texts) {
-    results.push(await embedText(t));
+  for (let i = 0; i < batchSize; i++) {
+    results.push(flat.slice(i * hiddenSize, (i + 1) * hiddenSize));
   }
   return results;
 }
