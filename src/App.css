@@ -34,6 +34,7 @@ body {
   color: var(--text);
   font-family: 'DM Sans', sans-serif;
   height: 100vh;
+  height: 100dvh;
   overflow: hidden;
 }
 
@@ -45,12 +46,27 @@ body {
   display: flex;
   flex-direction: column;
   height: 100vh;
+  height: 100dvh; /* accounts for mobile browser address bar / keyboard */
   max-width: 780px;
   margin: 0 auto;
   border-left: 1px solid var(--border);
   border-right: 1px solid var(--border);
   color: var(--text);
   background: var(--bg);
+}
+
+@media (max-width: 480px) {
+  .header { padding: 12px 14px; }
+  .header h1 { font-size: 16px; }
+  .logo { width: 36px; height: 36px; font-size: 16px; }
+  .header-actions { gap: 5px; }
+  .icon-btn { width: 30px; height: 30px; font-size: 12px; }
+  .clear-btn { padding: 6px 10px; font-size: 12px; }
+  .docs-bar { padding: 8px 14px; }
+  .chat-area { padding: 16px 12px; }
+  .bubble { max-width: 82%; font-size: 14px; }
+  .input-area { padding: 10px 12px; }
+  .input { font-size: 16px; } /* prevents iOS Safari from auto-zooming on focus */
 }
 
 .header {
