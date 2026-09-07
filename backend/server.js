@@ -22,17 +22,52 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Uploaded files kept in memory only long enough to extract their text.
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
 
 mongoose.connect(process.env.MONGO_URI)
   .then(async () => {
     console.log("✅ MongoDB connected");
-    await vectorStore.loadCacheFromDB(); // warm the RAG cache on startup
+    await vectorStore.loadCacheFromDB(); 
   })
   .catch((err) => console.error("❌ MongoDB error:", err));
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
+
+async function renderPageText(pageData) {
+  const textContent = await pageData.getTextContent();
+  const items = textContent.items;
+  if (items.length === 0) return "";
+
+  const pageWidth = pageData.view ? pageData.view[2] : 612;
+  const midX = pageWidth / 2;
+
+  const left = [];
+  const right = [];
+  for (const item of items) {
+    const x = item.transform[4];
+    const y = item.transform[5];
+    (x < midX ? left : right).push({ x, y, str: item.str });
+  }
+
+  const minoritySize = Math.min(left.length, right.length);
+  const isTwoColumn = minoritySize / items.length > 0.15;
+
+  const byReadingOrder = (arr) => arr.sort((a, b) => (b.y - a.y) || (a.x - b.x));
+
+  if (!isTwoColumn) {
+    const all = byReadingOrder([...left, ...right]);
+    return all.map((i) => i.str).join(" ");
+  }
+
+  byReadingOrder(left);
+  byReadingOrder(right);
+  return left.map((i) => i.str).join(" ") + "\n" + right.map((i) => i.str).join(" ");
+}
+
+async function extractPdfText(buffer) {
+  const parsed = await pdfParse(buffer, { pagerender: renderPageText });
+  return parsed.text;
+}
 
 app.post("/api/session", async (req, res) => {
   try {
@@ -54,9 +89,6 @@ app.get("/api/session/:sessionId", async (req, res) => {
   }
 });
 
-// ---------------------------------------------------------------------
-// RAG: document upload + ingestion
-// ---------------------------------------------------------------------
 app.post("/api/documents/upload", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
@@ -66,8 +98,7 @@ app.post("/api/documents/upload", upload.single("file"), async (req, res) => {
     let text = "";
 
     if (mimetype === "application/pdf" || lowerName.endsWith(".pdf")) {
-      const parsed = await pdfParse(buffer);
-      text = parsed.text;
+      text = await extractPdfText(buffer);
     } else if (
       lowerName.endsWith(".docx") ||
       mimetype === "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -118,11 +149,6 @@ app.delete("/api/documents/:filename", async (req, res) => {
   }
 });
 
-// ---------------------------------------------------------------------
-// Chat - now retrieval-augmented
-// ---------------------------------------------------------------------
-// Streaming chat endpoint - sends tokens to the client as they arrive (SSE),
-// and a final event with the list of sources used for RAG citations.
 app.post("/api/chat", async (req, res) => {
   const { message, sessionId } = req.body;
 
@@ -165,7 +191,7 @@ app.post("/api/chat", async (req, res) => {
         "Authorization": `Bearer ${GROQ_API_KEY}`
       },
       body: JSON.stringify({
-        model: "llama-3.3-70b-versatile",
+        model: "openai/gpt-oss-120b",
         messages: [
           { role: "system", content: systemContent },
           ...recentMessages
@@ -209,7 +235,6 @@ app.post("/api/chat", async (req, res) => {
             res.write(`data: ${JSON.stringify({ token })}\n\n`);
           }
         } catch (e) {
-          // ignore malformed partial JSON lines
         }
       }
     }
