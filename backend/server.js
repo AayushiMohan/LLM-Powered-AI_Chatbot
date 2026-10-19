@@ -9,6 +9,7 @@ const pdfParse = require("pdf-parse");
 const mammoth = require("mammoth");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+const { rateLimit } = require("express-rate-limit");
 const fetch = (...args) =>
   import("node-fetch").then(({ default: f }) => f(...args));
 require("dotenv").config();
@@ -27,8 +28,28 @@ if (!JWT_SECRET) {
 }
 
 const app = express();
+app.set("trust proxy", 1); // Render sits behind a proxy; needed so rate limits see the real client IP
 app.use(cors());
 app.use(express.json());
+
+// ---------------------------------------------------------------------
+// Rate limiting (protects the free Groq quota and the login endpoints)
+// ---------------------------------------------------------------------
+const makeLimiter = (windowMs, limit, message, perUser = false) =>
+  rateLimit({
+    windowMs,
+    limit,
+    standardHeaders: "draft-7",
+    legacyHeaders: false,
+    message: { error: message },
+    ...(perUser ? { keyGenerator: (req) => req.userId } : {}),
+  });
+
+// Login/signup: per IP, slows down password guessing
+const authLimiter = makeLimiter(15 * 60 * 1000, 20, "Too many attempts. Please try again in a few minutes.");
+// Chat and uploads: per logged-in user
+const chatLimiter = makeLimiter(60 * 1000, 20, "You're sending messages too fast. Please wait a moment.", true);
+const uploadLimiter = makeLimiter(10 * 60 * 1000, 10, "Too many uploads. Please try again in a few minutes.", true);
 
 // Uploaded files kept in memory only long enough to extract their text.
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
@@ -67,7 +88,7 @@ function requireAuth(req, res, next) {
   }
 }
 
-app.post("/api/auth/signup", async (req, res) => {
+app.post("/api/auth/signup", authLimiter, async (req, res) => {
   try {
     const { name, email, password } = req.body || {};
     if (!email || !EMAIL_RE.test(email)) {
@@ -95,7 +116,7 @@ app.post("/api/auth/signup", async (req, res) => {
   }
 });
 
-app.post("/api/auth/login", async (req, res) => {
+app.post("/api/auth/login", authLimiter, async (req, res) => {
   try {
     const { email, password } = req.body || {};
     if (!email || !password) {
@@ -265,7 +286,7 @@ app.delete("/api/sessions/:sessionId", requireAuth, async (req, res) => {
 // ---------------------------------------------------------------------
 // RAG: private per-user documents
 // ---------------------------------------------------------------------
-app.post("/api/documents/upload", requireAuth, upload.single("file"), async (req, res) => {
+app.post("/api/documents/upload", requireAuth, uploadLimiter, upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
 
@@ -332,7 +353,7 @@ app.delete("/api/documents/:filename", requireAuth, async (req, res) => {
 // ---------------------------------------------------------------------
 // Chat - retrieval-augmented, streamed (SSE), only uses this user's documents
 // ---------------------------------------------------------------------
-app.post("/api/chat", requireAuth, async (req, res) => {
+app.post("/api/chat", requireAuth, chatLimiter, async (req, res) => {
   const { message, sessionId } = req.body || {};
 
   if (!message || typeof message !== "string" || !sessionId) {
@@ -372,8 +393,15 @@ app.post("/api/chat", requireAuth, async (req, res) => {
 
     const sources = [...new Set(relevantChunks.map((c) => c.filename))];
 
+    // If the user presses "stop" (or closes the tab), cancel the Groq request too
+    const controller = new AbortController();
+    res.on("close", () => {
+      if (!res.writableEnded) controller.abort();
+    });
+
     const groqResponse = await fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
+      signal: controller.signal,
       headers: {
         "Content-Type": "application/json",
         "Authorization": `Bearer ${GROQ_API_KEY}`
@@ -402,37 +430,51 @@ app.post("/api/chat", requireAuth, async (req, res) => {
 
     let fullReply = "";
     let buffer = "";
+    let stopped = false;
 
-    for await (const chunk of groqResponse.body) {
-      buffer += chunk.toString("utf-8");
-      const lines = buffer.split("\n");
-      buffer = lines.pop(); // keep incomplete line for next chunk
+    try {
+      for await (const chunk of groqResponse.body) {
+        buffer += chunk.toString("utf-8");
+        const lines = buffer.split("\n");
+        buffer = lines.pop(); // keep incomplete line for next chunk
 
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed.startsWith("data:")) continue;
-        const payload = trimmed.slice(5).trim();
-        if (payload === "[DONE]") continue;
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith("data:")) continue;
+          const payload = trimmed.slice(5).trim();
+          if (payload === "[DONE]") continue;
 
-        try {
-          const parsed = JSON.parse(payload);
-          const token = parsed.choices?.[0]?.delta?.content;
-          if (token) {
-            fullReply += token;
-            res.write(`data: ${JSON.stringify({ token })}\n\n`);
+          try {
+            const parsed = JSON.parse(payload);
+            const token = parsed.choices?.[0]?.delta?.content;
+            if (token) {
+              fullReply += token;
+              res.write(`data: ${JSON.stringify({ token })}\n\n`);
+            }
+          } catch (e) {
+            // ignore malformed partial JSON lines
           }
-        } catch (e) {
-          // ignore malformed partial JSON lines
         }
+      }
+    } catch (e) {
+      if (e.name === "AbortError" || controller.signal.aborted) {
+        stopped = true; // user pressed stop - keep what was generated so far
+      } else {
+        throw e;
       }
     }
 
-    session.messages.push({ role: "assistant", content: fullReply || "(no response)" });
+    session.messages.push({
+      role: "assistant",
+      content: fullReply || (stopped ? "(stopped)" : "(no response)"),
+    });
     session.updatedAt = new Date();
     await session.save();
 
-    res.write(`data: ${JSON.stringify({ done: true, sources })}\n\n`);
-    res.end();
+    if (!stopped) {
+      res.write(`data: ${JSON.stringify({ done: true, sources })}\n\n`);
+      res.end();
+    }
 
   } catch (err) {
     console.error(err);
