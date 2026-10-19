@@ -230,13 +230,15 @@ export default function App() {
   const [chats, setChats] = useState([]);
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(false); // waiting for the first token
+  const [streaming, setStreaming] = useState(false); // a reply is in progress
   const [sessionId, setSessionId] = useState(null);
   const [documents, setDocuments] = useState([]);
   const [uploading, setUploading] = useState(false);
   const [theme, setTheme] = useState("dark");
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const bottomRef = useRef(null);
+  const abortRef = useRef(null);
 
   const welcome = (name) => ({
     role: "assistant",
@@ -338,7 +340,7 @@ export default function App() {
   }, [messages, loading]);
 
   const selectChat = async (id) => {
-    if (loading) return;
+    if (streaming) return;
     setSidebarOpen(false);
     if (id === sessionId) return;
     try {
@@ -349,7 +351,7 @@ export default function App() {
   };
 
   const newChat = async () => {
-    if (loading) return;
+    if (streaming) return;
     setSidebarOpen(false);
     // already sitting on an empty chat - nothing to do
     if (messages.every(m => m.role === "assistant")) return;
@@ -362,7 +364,7 @@ export default function App() {
 
   const deleteChat = async (id, e) => {
     e.stopPropagation();
-    if (loading) return;
+    if (streaming) return;
     if (!window.confirm("Delete this chat? This can't be undone.")) return;
     try {
       await authFetch(token, `/api/sessions/${id}`, { method: "DELETE" });
@@ -386,7 +388,7 @@ export default function App() {
 
   const sendMessage = async () => {
     const text = input.trim();
-    if (!text || loading || !sessionId) return;
+    if (!text || streaming || !sessionId) return;
 
     // Each assistant message gets an id so streamed updates always hit the right one
     const assistantId = `a-${Date.now()}`;
@@ -400,6 +402,10 @@ export default function App() {
     ]);
     setInput("");
     setLoading(true);
+    setStreaming(true);
+    const controller = new AbortController();
+    abortRef.current = controller;
+    let content = "";
 
     // Move this chat to the top of the list and name it from the first message
     setChats(prev => {
@@ -414,6 +420,7 @@ export default function App() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message: text, sessionId }),
+        signal: controller.signal,
       });
 
       if (res.status === 401) return logout();
@@ -427,7 +434,6 @@ export default function App() {
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
-      let content = "";
 
       setLoading(false); // tokens now render live
 
@@ -463,11 +469,20 @@ export default function App() {
         }
       }
     } catch (err) {
-      updateAssistant({ content: "⚠️ Could not connect to server." });
+      if (err.name === "AbortError") {
+        // user pressed stop: keep whatever was generated so far
+        if (!content) updateAssistant({ content: "(stopped)" });
+      } else {
+        updateAssistant({ content: "⚠️ Could not connect to server." });
+      }
     } finally {
       setLoading(false);
+      setStreaming(false);
+      abortRef.current = null;
     }
   };
+
+  const stopGenerating = () => abortRef.current?.abort();
 
   const handleKey = (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -477,7 +492,7 @@ export default function App() {
   };
 
   const clearChat = async () => {
-    if (!sessionId || loading) return;
+    if (!sessionId || streaming) return;
     await authFetch(token, `/api/sessions/${sessionId}/clear`, { method: "POST" });
     setMessages([{ role: "assistant", content: "Chat cleared! Start fresh 🚀" }]);
     setChats(prev => prev.map(c => (c.sessionId === sessionId ? { ...c, title: DEFAULT_TITLE } : c)));
@@ -586,13 +601,15 @@ export default function App() {
             onKeyDown={handleKey}
             rows={1}
           />
-          <button
-            className={`send-btn ${loading ? "disabled" : ""}`}
-            onClick={sendMessage}
-            disabled={loading}
-          >
-            {loading ? "..." : "➤"}
-          </button>
+          {streaming ? (
+            <button className="send-btn stop" onClick={stopGenerating} title="Stop generating">
+              ■
+            </button>
+          ) : (
+            <button className="send-btn" onClick={sendMessage} title="Send">
+              ➤
+            </button>
+          )}
         </footer>
       </div>
     </div>
