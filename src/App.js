@@ -1,8 +1,16 @@
-/* eslint-disable no-loop-func */
 import { useState, useRef, useEffect } from "react";
+import ReactMarkdown from "react-markdown";
 import "./App.css";
 
 const API_URL = process.env.REACT_APP_API_URL || "http://localhost:5000";
+const TOKEN_KEY = "shiva_token";
+
+// fetch wrapper that attaches the login token
+const authFetch = (token, path, options = {}) =>
+  fetch(`${API_URL}${path}`, {
+    ...options,
+    headers: { ...(options.headers || {}), Authorization: `Bearer ${token}` },
+  });
 
 function TypingIndicator() {
   return (
@@ -21,9 +29,15 @@ function Message({ msg }) {
       {msg.role === "assistant" && <div className="avatar">S</div>}
       <div>
         <div className="bubble">
-          {msg.content.split("\n").map((line, i, arr) => (
-            <span key={i}>{line}{i < arr.length - 1 && <br />}</span>
-          ))}
+          {msg.role === "assistant" ? (
+            <div className="markdown">
+              <ReactMarkdown>{msg.content}</ReactMarkdown>
+            </div>
+          ) : (
+            msg.content.split("\n").map((line, i, arr) => (
+              <span key={i}>{line}{i < arr.length - 1 && <br />}</span>
+            ))
+          )}
         </div>
         {msg.sources && msg.sources.length > 0 && (
           <div className="sources-row">
@@ -47,7 +61,7 @@ function DocumentsBar({ documents, onUpload, onDelete, uploading }) {
         className="upload-btn"
         onClick={() => fileInputRef.current?.click()}
         disabled={uploading}
-        title="Upload a .pdf or .txt file for Shiva to reference"
+        title="Upload a .pdf, .docx or .txt file for Shiva to reference"
       >
         {uploading ? "Uploading…" : "📎 Add knowledge"}
       </button>
@@ -74,7 +88,108 @@ function DocumentsBar({ documents, onUpload, onDelete, uploading }) {
   );
 }
 
+function AuthScreen({ onAuth, theme }) {
+  const [mode, setMode] = useState("login"); // "login" | "signup"
+  const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    if (busy) return;
+    setError("");
+    setBusy(true);
+    try {
+      const res = await fetch(`${API_URL}/api/auth/${mode}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, email, password }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setError(data.error || "Something went wrong");
+      } else {
+        onAuth(data.token, data.user);
+      }
+    } catch (err) {
+      setError("Could not connect to server.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="app auth-app" data-theme={theme}>
+      <div className="auth-wrap">
+        <form className="auth-card" onSubmit={submit}>
+          <div className="logo auth-logo">S</div>
+          <h2>{mode === "login" ? "Welcome back" : "Create your account"}</h2>
+          <p className="auth-sub">
+            {mode === "login"
+              ? "Log in to chat with Shiva and your documents."
+              : "Your documents stay private to your account."}
+          </p>
+
+          {mode === "signup" && (
+            <input
+              className="auth-input"
+              type="text"
+              placeholder="Name"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              autoComplete="name"
+            />
+          )}
+          <input
+            className="auth-input"
+            type="email"
+            placeholder="Email"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            autoComplete="email"
+            required
+          />
+          <input
+            className="auth-input"
+            type="password"
+            placeholder="Password (min 6 characters)"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            autoComplete={mode === "login" ? "current-password" : "new-password"}
+            required
+          />
+
+          {error && <div className="auth-error">{error}</div>}
+
+          <button className="auth-btn" type="submit" disabled={busy}>
+            {busy ? "Please wait…" : mode === "login" ? "Log in" : "Sign up"}
+          </button>
+          {busy && (
+            <div className="auth-hint">
+              The server may take up to a minute to wake up on the first request.
+            </div>
+          )}
+
+          <div className="auth-switch">
+            {mode === "login" ? "New here? " : "Already have an account? "}
+            <button
+              type="button"
+              onClick={() => { setMode(mode === "login" ? "signup" : "login"); setError(""); }}
+            >
+              {mode === "login" ? "Sign up" : "Log in"}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
+  const [token, setToken] = useState(() => localStorage.getItem(TOKEN_KEY));
+  const [user, setUser] = useState(null);
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -84,49 +199,70 @@ export default function App() {
   const [theme, setTheme] = useState("dark");
   const bottomRef = useRef(null);
 
-  const refreshDocuments = async () => {
+  const logout = () => {
+    localStorage.removeItem(TOKEN_KEY);
+    setToken(null);
+    setUser(null);
+    setMessages([]);
+    setDocuments([]);
+    setSessionId(null);
+  };
+
+  const handleAuth = (newToken, newUser) => {
+    localStorage.setItem(TOKEN_KEY, newToken);
+    setUser(newUser);
+    setToken(newToken);
+  };
+
+  const refreshDocuments = async (tk = token) => {
     try {
-      const res = await fetch(`${API_URL}/api/documents`);
+      const res = await authFetch(tk, "/api/documents");
+      if (res.status === 401) return logout();
       const data = await res.json();
       setDocuments(data.documents || []);
     } catch (e) {}
   };
 
+  // Load the user's chat + documents whenever we have a (new) token
   useEffect(() => {
-    const initSession = async () => {
-      let sid = localStorage.getItem("shiva_session_id");
+    if (!token) return;
+    let cancelled = false;
 
-      if (sid) {
-        try {
-          const res = await fetch(`${API_URL}/api/session/${sid}`);
-          if (res.ok) {
-            const data = await res.json();
-            setSessionId(sid);
-            setMessages(
-              data.messages.length > 0
-                ? data.messages
-                : [{ role: "assistant", content: "Welcome back! I'm Shiva 👋 Ask me anything!" }]
-            );
-            refreshDocuments();
-            return;
-          }
-        } catch (e) {}
-      }
-
+    const init = async () => {
       try {
-        const res = await fetch(`${API_URL}/api/session`, { method: "POST" });
-        const data = await res.json();
-        localStorage.setItem("shiva_session_id", data.sessionId);
-        setSessionId(data.sessionId);
-        setMessages([{ role: "assistant", content: "Hey! I'm Shiva 👋 Your AI assistant. Ask me anything! You can also upload a PDF or text file and I'll answer questions about it." }]);
-        refreshDocuments();
+        const [meRes, sessionRes] = await Promise.all([
+          authFetch(token, "/api/auth/me"),
+          authFetch(token, "/api/session", { method: "POST" }),
+        ]);
+
+        if (meRes.status === 401 || sessionRes.status === 401) {
+          if (!cancelled) logout();
+          return;
+        }
+
+        const me = await meRes.json();
+        const session = await sessionRes.json();
+        if (cancelled) return;
+
+        setUser(me.user);
+        setSessionId(session.sessionId);
+        setMessages(
+          session.messages.length > 0
+            ? session.messages
+            : [{ role: "assistant", content: `Hey ${me.user.name}! I'm Shiva 👋 Ask me anything, or upload a document and I'll answer from it.` }]
+        );
+        refreshDocuments(token);
       } catch (e) {
-        setMessages([{ role: "assistant", content: "⚠️ Could not connect to server." }]);
+        if (!cancelled) {
+          setMessages([{ role: "assistant", content: "⚠️ Could not connect to server." }]);
+        }
       }
     };
 
-    initSession();
-  }, []);
+    init();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -136,32 +272,31 @@ export default function App() {
     const text = input.trim();
     if (!text || loading || !sessionId) return;
 
-    setMessages(prev => [...prev, { role: "user", content: text }]);
+    // Each assistant message gets an id so streamed updates always hit the right one
+    const assistantId = `a-${Date.now()}`;
+    const updateAssistant = (patch) =>
+      setMessages(prev => prev.map(m => (m.id === assistantId ? { ...m, ...patch } : m)));
+
+    setMessages(prev => [
+      ...prev,
+      { role: "user", content: text },
+      { id: assistantId, role: "assistant", content: "" },
+    ]);
     setInput("");
     setLoading(true);
 
-    // Placeholder assistant message that we'll fill in as tokens stream in
-    let assistantIndex;
-    setMessages(prev => {
-      assistantIndex = prev.length;
-      return [...prev, { role: "assistant", content: "" }];
-    });
-
     try {
-      const res = await fetch(`${API_URL}/api/chat`, {
+      const res = await authFetch(token, "/api/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ message: text, sessionId }),
       });
 
+      if (res.status === 401) return logout();
+
       if (!res.ok || !res.body) {
         const data = await res.json().catch(() => ({}));
-        setMessages(prev => {
-          const copy = [...prev];
-          copy[assistantIndex] = { role: "assistant", content: `⚠️ Error: ${data.error || "Something went wrong"}` };
-          return copy;
-        });
-        setLoading(false);
+        updateAssistant({ content: `⚠️ Error: ${data.error || "Something went wrong"}` });
         return;
       }
 
@@ -170,18 +305,18 @@ export default function App() {
       let buffer = "";
       let content = "";
 
-      setLoading(false); // typing indicator was for "waiting to start"; now tokens render live
+      setLoading(false); // tokens now render live
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
 
         buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n\n");
-        buffer = lines.pop();
+        const events = buffer.split("\n\n");
+        buffer = events.pop();
 
-        for (const line of lines) {
-          const trimmed = line.trim();
+        for (const event of events) {
+          const trimmed = event.trim();
           if (!trimmed.startsWith("data:")) continue;
           const jsonStr = trimmed.slice(5).trim();
           if (!jsonStr) continue;
@@ -190,27 +325,13 @@ export default function App() {
             const parsed = JSON.parse(jsonStr);
             if (parsed.token) {
               content += parsed.token;
-              const snapshot = content;
-              setMessages(prev => {
-                const copy = [...prev];
-                copy[assistantIndex] = { role: "assistant", content: snapshot };
-                return copy;
-              });
+              updateAssistant({ content });
             }
             if (parsed.done) {
-              const sources = parsed.sources || [];
-              setMessages(prev => {
-                const copy = [...prev];
-                copy[assistantIndex] = { role: "assistant", content, sources };
-                return copy;
-              });
+              updateAssistant({ content, sources: parsed.sources || [] });
             }
             if (parsed.error) {
-              setMessages(prev => {
-                const copy = [...prev];
-                copy[assistantIndex] = { role: "assistant", content: `⚠️ Error: ${parsed.error}` };
-                return copy;
-              });
+              updateAssistant({ content: `⚠️ Error: ${parsed.error}` });
             }
           } catch (e) {
             // ignore partial/malformed SSE lines
@@ -218,11 +339,7 @@ export default function App() {
         }
       }
     } catch (err) {
-      setMessages(prev => {
-        const copy = [...prev];
-        copy[assistantIndex] = { role: "assistant", content: "⚠️ Could not connect to server." };
-        return copy;
-      });
+      updateAssistant({ content: "⚠️ Could not connect to server." });
     } finally {
       setLoading(false);
     }
@@ -237,7 +354,7 @@ export default function App() {
 
   const clearChat = async () => {
     if (!sessionId) return;
-    await fetch(`${API_URL}/api/session/${sessionId}`, { method: "DELETE" });
+    await authFetch(token, `/api/session/${sessionId}`, { method: "DELETE" });
     setMessages([{ role: "assistant", content: "Chat cleared! Start fresh 🚀" }]);
   };
 
@@ -246,10 +363,11 @@ export default function App() {
     try {
       const formData = new FormData();
       formData.append("file", file);
-      const res = await fetch(`${API_URL}/api/documents/upload`, {
+      const res = await authFetch(token, "/api/documents/upload", {
         method: "POST",
         body: formData,
       });
+      if (res.status === 401) return logout();
       const data = await res.json();
       if (data.error) {
         setMessages(prev => [...prev, { role: "assistant", content: `⚠️ Upload failed: ${data.error}` }]);
@@ -266,7 +384,7 @@ export default function App() {
 
   const handleDeleteDoc = async (filename) => {
     try {
-      await fetch(`${API_URL}/api/documents/${encodeURIComponent(filename)}`, { method: "DELETE" });
+      await authFetch(token, `/api/documents/${encodeURIComponent(filename)}`, { method: "DELETE" });
       refreshDocuments();
     } catch (e) {}
   };
@@ -284,6 +402,10 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
+  if (!token) {
+    return <AuthScreen onAuth={handleAuth} theme={theme} />;
+  }
+
   return (
     <div className="app" data-theme={theme}>
       <header className="header">
@@ -291,7 +413,7 @@ export default function App() {
           <div className="logo">S</div>
           <div>
             <h1>Shiva</h1>
-            <span className="status">● Online</span>
+            <span className="status">● {user ? user.name : "Online"}</span>
           </div>
         </div>
         <div className="header-actions">
@@ -300,6 +422,7 @@ export default function App() {
           </button>
           <button className="icon-btn" onClick={exportChat} title="Export chat">⬇️</button>
           <button className="clear-btn" onClick={clearChat}>Clear Chat</button>
+          <button className="icon-btn" onClick={logout} title="Log out">🚪</button>
         </div>
       </header>
 
@@ -311,7 +434,7 @@ export default function App() {
       />
 
       <main className="chat-area">
-        {messages.map((msg, i) => <Message key={i} msg={msg} />)}
+        {messages.map((msg, i) => <Message key={msg.id || i} msg={msg} />)}
         {loading && <TypingIndicator />}
         <div ref={bottomRef} />
       </main>
@@ -336,4 +459,3 @@ export default function App() {
     </div>
   );
 }
-  
