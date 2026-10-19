@@ -11,6 +11,7 @@ const MessageSchema = new mongoose.Schema(
 const SessionSchema = new mongoose.Schema({
   sessionId: { type: String, required: true, unique: true, index: true },
   userId: { type: String, index: true }, // owner of this chat
+  title: { type: String, default: "New chat" },
   messages: { type: [MessageSchema], default: [] },
   createdAt: { type: Date, default: Date.now },
   updatedAt: { type: Date, default: Date.now },
