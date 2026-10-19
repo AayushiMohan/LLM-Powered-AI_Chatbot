@@ -88,6 +88,43 @@ function DocumentsBar({ documents, onUpload, onDelete, uploading }) {
   );
 }
 
+const DEFAULT_TITLE = "New chat";
+const makeTitle = (text) => {
+  const t = text.replace(/\s+/g, " ").trim();
+  return t.length > 40 ? t.slice(0, 40).trimEnd() + "…" : t;
+};
+
+function Sidebar({ chats, activeId, open, onSelect, onNew, onDelete, onClose }) {
+  return (
+    <aside className={`sidebar ${open ? "open" : ""}`}>
+      <div className="sidebar-top">
+        <button className="new-chat-btn" onClick={onNew}>＋ New chat</button>
+        <button className="icon-btn sidebar-close" onClick={onClose} title="Close">✕</button>
+      </div>
+      <div className="chat-list">
+        {chats.length === 0 && <div className="chat-empty">No chats yet</div>}
+        {chats.map((c) => (
+          <div
+            key={c.sessionId}
+            className={`chat-item ${c.sessionId === activeId ? "active" : ""}`}
+            onClick={() => onSelect(c.sessionId)}
+            title={c.title}
+          >
+            <span className="chat-title">{c.title}</span>
+            <button
+              className="chat-del"
+              onClick={(e) => onDelete(c.sessionId, e)}
+              title="Delete chat"
+            >
+              🗑
+            </button>
+          </div>
+        ))}
+      </div>
+    </aside>
+  );
+}
+
 function AuthScreen({ onAuth, theme }) {
   const [mode, setMode] = useState("login"); // "login" | "signup"
   const [name, setName] = useState("");
@@ -190,6 +227,7 @@ function AuthScreen({ onAuth, theme }) {
 export default function App() {
   const [token, setToken] = useState(() => localStorage.getItem(TOKEN_KEY));
   const [user, setUser] = useState(null);
+  const [chats, setChats] = useState([]);
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
@@ -197,15 +235,23 @@ export default function App() {
   const [documents, setDocuments] = useState([]);
   const [uploading, setUploading] = useState(false);
   const [theme, setTheme] = useState("dark");
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const bottomRef = useRef(null);
+
+  const welcome = (name) => ({
+    role: "assistant",
+    content: `Hey ${name || "there"}! I'm Shiva 👋 Ask me anything, or upload a document and I'll answer from it.`,
+  });
 
   const logout = () => {
     localStorage.removeItem(TOKEN_KEY);
     setToken(null);
     setUser(null);
+    setChats([]);
     setMessages([]);
     setDocuments([]);
     setSessionId(null);
+    setSidebarOpen(false);
   };
 
   const handleAuth = (newToken, newUser) => {
@@ -223,34 +269,57 @@ export default function App() {
     } catch (e) {}
   };
 
-  // Load the user's chat + documents whenever we have a (new) token
+  // Open one chat: fetch its messages and make it the active chat
+  const loadChat = async (tk, id, name) => {
+    const res = await authFetch(tk, `/api/sessions/${id}`);
+    if (res.status === 401) return logout();
+    const data = await res.json();
+    setSessionId(id);
+    setMessages(data.messages && data.messages.length > 0 ? data.messages : [welcome(name)]);
+  };
+
+  // Ask the server for a new (or re-usable empty) chat
+  const createChat = async () => {
+    const res = await authFetch(token, "/api/sessions", { method: "POST" });
+    if (res.status === 401) { logout(); return null; }
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      setMessages(prev => [...prev, { role: "assistant", content: `⚠️ ${data.error || "Could not create a new chat"}` }]);
+      return null;
+    }
+    return data;
+  };
+
+  // Load the user's chats + documents whenever we have a (new) token
   useEffect(() => {
     if (!token) return;
     let cancelled = false;
 
     const init = async () => {
       try {
-        const [meRes, sessionRes] = await Promise.all([
+        const [meRes, listRes] = await Promise.all([
           authFetch(token, "/api/auth/me"),
-          authFetch(token, "/api/session", { method: "POST" }),
+          authFetch(token, "/api/sessions"),
         ]);
 
-        if (meRes.status === 401 || sessionRes.status === 401) {
+        if (meRes.status === 401 || listRes.status === 401) {
           if (!cancelled) logout();
           return;
         }
 
         const me = await meRes.json();
-        const session = await sessionRes.json();
+        const list = await listRes.json();
+        let sessions = list.sessions || [];
+
+        if (sessions.length === 0) {
+          const created = await authFetch(token, "/api/sessions", { method: "POST" });
+          sessions = [await created.json()];
+        }
         if (cancelled) return;
 
         setUser(me.user);
-        setSessionId(session.sessionId);
-        setMessages(
-          session.messages.length > 0
-            ? session.messages
-            : [{ role: "assistant", content: `Hey ${me.user.name}! I'm Shiva 👋 Ask me anything, or upload a document and I'll answer from it.` }]
-        );
+        setChats(sessions);
+        await loadChat(token, sessions[0].sessionId, me.user.name);
         refreshDocuments(token);
       } catch (e) {
         if (!cancelled) {
@@ -268,6 +337,53 @@ export default function App() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, loading]);
 
+  const selectChat = async (id) => {
+    if (loading) return;
+    setSidebarOpen(false);
+    if (id === sessionId) return;
+    try {
+      await loadChat(token, id, user?.name);
+    } catch (e) {
+      setMessages([{ role: "assistant", content: "⚠️ Could not open this chat." }]);
+    }
+  };
+
+  const newChat = async () => {
+    if (loading) return;
+    setSidebarOpen(false);
+    // already sitting on an empty chat - nothing to do
+    if (messages.every(m => m.role === "assistant")) return;
+    const chat = await createChat();
+    if (!chat) return;
+    setChats(prev => (prev.some(c => c.sessionId === chat.sessionId) ? prev : [chat, ...prev]));
+    setSessionId(chat.sessionId);
+    setMessages([welcome(user?.name)]);
+  };
+
+  const deleteChat = async (id, e) => {
+    e.stopPropagation();
+    if (loading) return;
+    if (!window.confirm("Delete this chat? This can't be undone.")) return;
+    try {
+      await authFetch(token, `/api/sessions/${id}`, { method: "DELETE" });
+    } catch (err) {
+      return;
+    }
+    const remaining = chats.filter(c => c.sessionId !== id);
+    setChats(remaining);
+
+    if (id !== sessionId) return;
+    if (remaining.length > 0) {
+      await loadChat(token, remaining[0].sessionId, user?.name);
+    } else {
+      const chat = await createChat();
+      if (!chat) return;
+      setChats([chat]);
+      setSessionId(chat.sessionId);
+      setMessages([welcome(user?.name)]);
+    }
+  };
+
   const sendMessage = async () => {
     const text = input.trim();
     if (!text || loading || !sessionId) return;
@@ -284,6 +400,14 @@ export default function App() {
     ]);
     setInput("");
     setLoading(true);
+
+    // Move this chat to the top of the list and name it from the first message
+    setChats(prev => {
+      const current = prev.find(c => c.sessionId === sessionId);
+      const title = current && current.title !== DEFAULT_TITLE ? current.title : makeTitle(text);
+      const rest = prev.filter(c => c.sessionId !== sessionId);
+      return [{ sessionId, title, updatedAt: new Date().toISOString() }, ...rest];
+    });
 
     try {
       const res = await authFetch(token, "/api/chat", {
@@ -353,9 +477,10 @@ export default function App() {
   };
 
   const clearChat = async () => {
-    if (!sessionId) return;
-    await authFetch(token, `/api/session/${sessionId}`, { method: "DELETE" });
+    if (!sessionId || loading) return;
+    await authFetch(token, `/api/sessions/${sessionId}/clear`, { method: "POST" });
     setMessages([{ role: "assistant", content: "Chat cleared! Start fresh 🚀" }]);
+    setChats(prev => prev.map(c => (c.sessionId === sessionId ? { ...c, title: DEFAULT_TITLE } : c)));
   };
 
   const handleUpload = async (file) => {
@@ -408,54 +533,68 @@ export default function App() {
 
   return (
     <div className="app" data-theme={theme}>
-      <header className="header">
-        <div className="header-left">
-          <div className="logo">S</div>
-          <div>
-            <h1>Shiva</h1>
-            <span className="status">● {user ? user.name : "Online"}</span>
-          </div>
-        </div>
-        <div className="header-actions">
-          <button className="icon-btn" onClick={toggleTheme} title="Toggle theme">
-            {theme === "dark" ? "☀️" : "🌙"}
-          </button>
-          <button className="icon-btn" onClick={exportChat} title="Export chat">⬇️</button>
-          <button className="clear-btn" onClick={clearChat}>Clear Chat</button>
-          <button className="icon-btn" onClick={logout} title="Log out">🚪</button>
-        </div>
-      </header>
-
-      <DocumentsBar
-        documents={documents}
-        onUpload={handleUpload}
-        onDelete={handleDeleteDoc}
-        uploading={uploading}
+      <Sidebar
+        chats={chats}
+        activeId={sessionId}
+        open={sidebarOpen}
+        onSelect={selectChat}
+        onNew={newChat}
+        onDelete={deleteChat}
+        onClose={() => setSidebarOpen(false)}
       />
+      {sidebarOpen && <div className="backdrop" onClick={() => setSidebarOpen(false)} />}
 
-      <main className="chat-area">
-        {messages.map((msg, i) => <Message key={msg.id || i} msg={msg} />)}
-        {loading && <TypingIndicator />}
-        <div ref={bottomRef} />
-      </main>
+      <div className="chat-pane">
+        <header className="header">
+          <div className="header-left">
+            <button className="icon-btn menu-btn" onClick={() => setSidebarOpen(o => !o)} title="Chats">☰</button>
+            <div className="logo">S</div>
+            <div>
+              <h1>Shiva</h1>
+              <span className="status">● {user ? user.name : "Online"}</span>
+            </div>
+          </div>
+          <div className="header-actions">
+            <button className="icon-btn" onClick={toggleTheme} title="Toggle theme">
+              {theme === "dark" ? "☀️" : "🌙"}
+            </button>
+            <button className="icon-btn" onClick={exportChat} title="Export chat">⬇️</button>
+            <button className="clear-btn" onClick={clearChat}>Clear Chat</button>
+            <button className="icon-btn" onClick={logout} title="Log out">🚪</button>
+          </div>
+        </header>
 
-      <footer className="input-area">
-        <textarea
-          className="input"
-          placeholder="Message Shiva... (Enter to send, Shift+Enter for new line)"
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={handleKey}
-          rows={1}
+        <DocumentsBar
+          documents={documents}
+          onUpload={handleUpload}
+          onDelete={handleDeleteDoc}
+          uploading={uploading}
         />
-        <button
-          className={`send-btn ${loading ? "disabled" : ""}`}
-          onClick={sendMessage}
-          disabled={loading}
-        >
-          {loading ? "..." : "➤"}
-        </button>
-      </footer>
+
+        <main className="chat-area">
+          {messages.map((msg, i) => <Message key={msg.id || i} msg={msg} />)}
+          {loading && <TypingIndicator />}
+          <div ref={bottomRef} />
+        </main>
+
+        <footer className="input-area">
+          <textarea
+            className="input"
+            placeholder="Message Shiva... (Enter to send, Shift+Enter for new line)"
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={handleKey}
+            rows={1}
+          />
+          <button
+            className={`send-btn ${loading ? "disabled" : ""}`}
+            onClick={sendMessage}
+            disabled={loading}
+          >
+            {loading ? "..." : "➤"}
+          </button>
+        </footer>
+      </div>
     </div>
   );
 }
