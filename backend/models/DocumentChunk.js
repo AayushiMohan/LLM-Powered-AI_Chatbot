@@ -1,6 +1,7 @@
 const mongoose = require("mongoose");
 
 const DocumentChunkSchema = new mongoose.Schema({
+  userId: { type: String, required: true, index: true }, // owner of this document
   filename: { type: String, required: true, index: true },
   chunkIndex: { type: Number, required: true },
   text: { type: String, required: true },
