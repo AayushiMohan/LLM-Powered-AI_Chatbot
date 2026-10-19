@@ -602,3 +602,12 @@ body {
 @media (max-width: 480px) {
   .header .logo { display: none; }
 }
+
+/* --- Stop generating button --- */
+.send-btn.stop {
+  background: var(--surface2);
+  border: 1px solid var(--accent);
+  color: var(--text);
+  font-size: 14px;
+}
+.send-btn.stop:hover { opacity: 0.85; }
