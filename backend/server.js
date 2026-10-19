@@ -7,32 +7,124 @@ const { v4: uuidv4 } = require("uuid");
 const multer = require("multer");
 const pdfParse = require("pdf-parse");
 const mammoth = require("mammoth");
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
 const fetch = (...args) =>
   import("node-fetch").then(({ default: f }) => f(...args));
 require("dotenv").config();
-console.log("MONGO_URI:", process.env.MONGO_URI); // debug
 
+const User = require("./models/User");
 const Session = require("./models/Session");
 const DocumentChunk = require("./models/DocumentChunk");
 const { chunkText } = require("./services/textSplitter");
 const { embedText, embedBatch } = require("./services/embeddingService");
 const vectorStore = require("./services/vectorStore");
 
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  console.error("❌ JWT_SECRET is missing. Add it to your .env (and to Render's environment variables).");
+  process.exit(1);
+}
+
 const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Uploaded files kept in memory only long enough to extract their text.
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
 
 mongoose.connect(process.env.MONGO_URI)
   .then(async () => {
     console.log("✅ MongoDB connected");
-    await vectorStore.loadCacheFromDB(); 
+    await vectorStore.loadCacheFromDB(); // warm the RAG cache on startup
   })
   .catch((err) => console.error("❌ MongoDB error:", err));
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 
+// ---------------------------------------------------------------------
+// Auth helpers
+// ---------------------------------------------------------------------
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+const signToken = (user) =>
+  jwt.sign({ id: user._id.toString() }, JWT_SECRET, { expiresIn: "7d" });
+
+const publicUser = (user) => ({ name: user.name, email: user.email });
+
+// Protects a route: requires "Authorization: Bearer <token>"
+function requireAuth(req, res, next) {
+  const header = req.headers.authorization || "";
+  const token = header.startsWith("Bearer ") ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ error: "Please log in" });
+
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    req.userId = payload.id;
+    next();
+  } catch (e) {
+    res.status(401).json({ error: "Session expired, please log in again" });
+  }
+}
+
+app.post("/api/auth/signup", async (req, res) => {
+  try {
+    const { name, email, password } = req.body || {};
+    if (!email || !EMAIL_RE.test(email)) {
+      return res.status(400).json({ error: "Please enter a valid email" });
+    }
+    if (!password || password.length < 6) {
+      return res.status(400).json({ error: "Password must be at least 6 characters" });
+    }
+
+    const normalized = email.trim().toLowerCase();
+    if (await User.findOne({ email: normalized })) {
+      return res.status(409).json({ error: "An account with this email already exists" });
+    }
+
+    const passwordHash = await bcrypt.hash(password, 10);
+    const user = await User.create({
+      name: (name || "").trim() || normalized.split("@")[0],
+      email: normalized,
+      passwordHash,
+    });
+
+    res.json({ token: signToken(user), user: publicUser(user) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/auth/login", async (req, res) => {
+  try {
+    const { email, password } = req.body || {};
+    if (!email || !password) {
+      return res.status(400).json({ error: "Email and password are required" });
+    }
+
+    const user = await User.findOne({ email: String(email).trim().toLowerCase() });
+    const ok = user && (await bcrypt.compare(password, user.passwordHash));
+    if (!ok) return res.status(401).json({ error: "Invalid email or password" });
+
+    res.json({ token: signToken(user), user: publicUser(user) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/auth/me", requireAuth, async (req, res) => {
+  try {
+    const user = await User.findById(req.userId);
+    if (!user) return res.status(401).json({ error: "Account not found" });
+    res.json({ user: publicUser(user) });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ---------------------------------------------------------------------
+// PDF extraction (column-aware for two-column academic papers)
+// ---------------------------------------------------------------------
 async function renderPageText(pageData) {
   const textContent = await pageData.getTextContent();
   const items = textContent.items;
@@ -49,6 +141,7 @@ async function renderPageText(pageData) {
     (x < midX ? left : right).push({ x, y, str: item.str });
   }
 
+  // Not meaningfully split across both halves -> single column page.
   const minoritySize = Math.min(left.length, right.length);
   const isTwoColumn = minoritySize / items.length > 0.15;
 
@@ -69,27 +162,38 @@ async function extractPdfText(buffer) {
   return parsed.text;
 }
 
-app.post("/api/session", async (req, res) => {
+// ---------------------------------------------------------------------
+// Session (one chat per user)
+// ---------------------------------------------------------------------
+// Finds the logged-in user's chat, or creates it the first time.
+app.post("/api/session", requireAuth, async (req, res) => {
   try {
-    const sessionId = uuidv4();
-    await Session.create({ sessionId, messages: [] });
-    res.json({ sessionId });
+    let session = await Session.findOne({ userId: req.userId });
+    if (!session) {
+      session = await Session.create({ sessionId: uuidv4(), userId: req.userId, messages: [] });
+    }
+    res.json({ sessionId: session.sessionId, messages: session.messages });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.get("/api/session/:sessionId", async (req, res) => {
+app.delete("/api/session/:sessionId", requireAuth, async (req, res) => {
   try {
-    const session = await Session.findOne({ sessionId: req.params.sessionId });
-    if (!session) return res.status(404).json({ error: "Session not found" });
-    res.json({ messages: session.messages });
+    await Session.findOneAndUpdate(
+      { sessionId: req.params.sessionId, userId: req.userId },
+      { messages: [], updatedAt: new Date() }
+    );
+    res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.post("/api/documents/upload", upload.single("file"), async (req, res) => {
+// ---------------------------------------------------------------------
+// RAG: private per-user documents
+// ---------------------------------------------------------------------
+app.post("/api/documents/upload", requireAuth, upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
 
@@ -106,7 +210,6 @@ app.post("/api/documents/upload", upload.single("file"), async (req, res) => {
       const result = await mammoth.extractRawText({ buffer });
       text = result.value;
     } else {
-      // .txt, .md, and anything else plain-text
       text = buffer.toString("utf-8");
     }
 
@@ -117,8 +220,13 @@ app.post("/api/documents/upload", upload.single("file"), async (req, res) => {
 
     const embeddings = await embedBatch(chunks);
 
+    // Re-uploading the same filename replaces the old copy instead of duplicating it.
+    await DocumentChunk.deleteMany({ userId: req.userId, filename: originalname });
+    vectorStore.removeFromCache(req.userId, originalname);
+
     const docs = await DocumentChunk.insertMany(
       chunks.map((chunk, i) => ({
+        userId: req.userId,
         filename: originalname,
         chunkIndex: i,
         text: chunk,
@@ -135,29 +243,36 @@ app.post("/api/documents/upload", upload.single("file"), async (req, res) => {
   }
 });
 
-app.get("/api/documents", (req, res) => {
-  res.json({ documents: vectorStore.listDocuments() });
+app.get("/api/documents", requireAuth, (req, res) => {
+  res.json({ documents: vectorStore.listDocuments(req.userId) });
 });
 
-app.delete("/api/documents/:filename", async (req, res) => {
+app.delete("/api/documents/:filename", requireAuth, async (req, res) => {
   try {
-    await DocumentChunk.deleteMany({ filename: req.params.filename });
-    vectorStore.removeFromCache(req.params.filename);
+    await DocumentChunk.deleteMany({ userId: req.userId, filename: req.params.filename });
+    vectorStore.removeFromCache(req.userId, req.params.filename);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.post("/api/chat", async (req, res) => {
-  const { message, sessionId } = req.body;
+// ---------------------------------------------------------------------
+// Chat - retrieval-augmented, streamed (SSE), only uses this user's documents
+// ---------------------------------------------------------------------
+app.post("/api/chat", requireAuth, async (req, res) => {
+  const { message, sessionId } = req.body || {};
 
-  if (!message || !sessionId) {
+  if (!message || typeof message !== "string" || !sessionId) {
     return res.status(400).json({ error: "message and sessionId required" });
+  }
+  if (message.length > 4000) {
+    return res.status(400).json({ error: "Message is too long (max 4000 characters)" });
   }
 
   try {
-    const session = await Session.findOne({ sessionId });
+    // userId in the query makes sure nobody can chat into someone else's session
+    const session = await Session.findOne({ sessionId, userId: req.userId });
     if (!session) return res.status(404).json({ error: "Session not found" });
 
     session.messages.push({ role: "user", content: message });
@@ -167,11 +282,12 @@ app.post("/api/chat", async (req, res) => {
       content: m.content
     }));
 
-    // --- RAG retrieval step ---
-    let systemContent = "You are Shiva, a helpful and friendly AI assistant. You are knowledgeable, concise, and always try to give the most useful response possible.";
+    // --- RAG retrieval step (only this user's documents) ---
+    let systemContent = "You are Shiva, a helpful and friendly AI assistant. You are knowledgeable, concise, and always try to give the most useful response possible. Format answers with Markdown when it helps readability.";
 
-    const queryEmbedding = await embedText(message);
-    const relevantChunks = vectorStore.search(queryEmbedding, 4);
+    // Skip the embedding model entirely if the user has no documents (faster plain chat).
+    const queryEmbedding = vectorStore.hasDocuments(req.userId) ? await embedText(message) : null;
+    const relevantChunks = vectorStore.search(req.userId, queryEmbedding, 4);
 
     if (relevantChunks.length > 0) {
       const contextBlock = relevantChunks
@@ -181,7 +297,6 @@ app.post("/api/chat", async (req, res) => {
       systemContent += `\n\nUse the following retrieved context to answer the user's question when it's relevant. If the context doesn't contain the answer, say so and answer from your own knowledge instead. Do not mention "chunks" or the retrieval mechanism to the user - just answer naturally.\n\nContext:\n${contextBlock}`;
     }
 
-    // Unique source filenames, in relevance order
     const sources = [...new Set(relevantChunks.map((c) => c.filename))];
 
     const groqResponse = await fetch("https://api.groq.com/openai/v1/chat/completions", {
@@ -207,7 +322,6 @@ app.post("/api/chat", async (req, res) => {
       return res.status(500).json({ error: errData.error?.message || "Groq API error" });
     }
 
-    // Set up SSE response to the frontend
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
     res.setHeader("Connection", "keep-alive");
@@ -235,11 +349,12 @@ app.post("/api/chat", async (req, res) => {
             res.write(`data: ${JSON.stringify({ token })}\n\n`);
           }
         } catch (e) {
+          
         }
       }
     }
 
-    session.messages.push({ role: "assistant", content: fullReply });
+    session.messages.push({ role: "assistant", content: fullReply || "(no response)" });
     session.updatedAt = new Date();
     await session.save();
 
@@ -254,18 +369,6 @@ app.post("/api/chat", async (req, res) => {
       res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
       res.end();
     }
-  }
-});
-
-app.delete("/api/session/:sessionId", async (req, res) => {
-  try {
-    await Session.findOneAndUpdate(
-      { sessionId: req.params.sessionId },
-      { messages: [], updatedAt: new Date() }
-    );
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
   }
 });
 
