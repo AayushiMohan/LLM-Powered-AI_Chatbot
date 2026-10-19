@@ -163,27 +163,99 @@ async function extractPdfText(buffer) {
 }
 
 // ---------------------------------------------------------------------
-// Session (one chat per user)
+// Chats (many per user)
 // ---------------------------------------------------------------------
-// Finds the logged-in user's chat, or creates it the first time.
-app.post("/api/session", requireAuth, async (req, res) => {
+const DEFAULT_TITLE = "New chat";
+const MAX_CHATS_PER_USER = 100;
+
+const makeTitle = (text) => {
+  const t = String(text).replace(/\s+/g, " ").trim();
+  return t.length > 40 ? t.slice(0, 40).trimEnd() + "…" : t;
+};
+
+// List the user's chats (newest first). Only the first message is loaded,
+// just enough to name older chats that don't have a title yet.
+app.get("/api/sessions", requireAuth, async (req, res) => {
   try {
-    let session = await Session.findOne({ userId: req.userId });
+    const sessions = await Session.find(
+      { userId: req.userId },
+      { messages: { $slice: 1 } }
+    )
+      .sort({ updatedAt: -1 })
+      .limit(MAX_CHATS_PER_USER)
+      .lean();
+
+    res.json({
+      sessions: sessions.map((s) => {
+        const first = s.messages && s.messages[0];
+        const title =
+          s.title && s.title !== DEFAULT_TITLE
+            ? s.title
+            : first && first.role === "user"
+            ? makeTitle(first.content)
+            : DEFAULT_TITLE;
+        return { sessionId: s.sessionId, title, updatedAt: s.updatedAt };
+      }),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Start a new chat (re-uses an existing empty one instead of piling up blanks).
+app.post("/api/sessions", requireAuth, async (req, res) => {
+  try {
+    let session = await Session.findOne({ userId: req.userId, messages: { $size: 0 } });
     if (!session) {
-      session = await Session.create({ sessionId: uuidv4(), userId: req.userId, messages: [] });
+      const count = await Session.countDocuments({ userId: req.userId });
+      if (count >= MAX_CHATS_PER_USER) {
+        return res.status(400).json({ error: "Chat limit reached. Please delete some old chats." });
+      }
+      session = await Session.create({
+        sessionId: uuidv4(),
+        userId: req.userId,
+        title: DEFAULT_TITLE,
+        messages: [],
+      });
     }
+    res.json({
+      sessionId: session.sessionId,
+      title: session.title || DEFAULT_TITLE,
+      updatedAt: session.updatedAt,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Load one chat's messages.
+app.get("/api/sessions/:sessionId", requireAuth, async (req, res) => {
+  try {
+    const session = await Session.findOne({ sessionId: req.params.sessionId, userId: req.userId });
+    if (!session) return res.status(404).json({ error: "Chat not found" });
     res.json({ sessionId: session.sessionId, messages: session.messages });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-app.delete("/api/session/:sessionId", requireAuth, async (req, res) => {
+// Empty a chat but keep it in the list.
+app.post("/api/sessions/:sessionId/clear", requireAuth, async (req, res) => {
   try {
     await Session.findOneAndUpdate(
       { sessionId: req.params.sessionId, userId: req.userId },
-      { messages: [], updatedAt: new Date() }
+      { messages: [], title: DEFAULT_TITLE, updatedAt: new Date() }
     );
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Delete a chat completely.
+app.delete("/api/sessions/:sessionId", requireAuth, async (req, res) => {
+  try {
+    await Session.deleteOne({ sessionId: req.params.sessionId, userId: req.userId });
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -275,6 +347,7 @@ app.post("/api/chat", requireAuth, async (req, res) => {
     const session = await Session.findOne({ sessionId, userId: req.userId });
     if (!session) return res.status(404).json({ error: "Session not found" });
 
+    if (session.messages.length === 0) session.title = makeTitle(message);
     session.messages.push({ role: "user", content: message });
 
     const recentMessages = session.messages.slice(-20).map(m => ({
@@ -349,7 +422,7 @@ app.post("/api/chat", requireAuth, async (req, res) => {
             res.write(`data: ${JSON.stringify({ token })}\n\n`);
           }
         } catch (e) {
-          
+          // ignore malformed partial JSON lines
         }
       }
     }
