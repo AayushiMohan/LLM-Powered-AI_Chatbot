@@ -162,7 +162,7 @@ function AuthScreen({ onAuth, theme }) {
       <div className="auth-wrap">
         <form className="auth-card" onSubmit={submit}>
           <div className="logo auth-logo">S</div>
-          <h2>{mode === "login" ? "Welcome back" : "Create your account"}</h2>
+          <h2>{mode === "login" ? "Welcome" : "Create your account"}</h2>
           <p className="auth-sub">
             {mode === "login"
               ? "Log in to chat with Shiva and your documents."
